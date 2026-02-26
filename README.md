@@ -71,6 +71,23 @@ rsyncer my_run_001 --filter
 
 Before syncing, lists all file extensions found in the remote directory and lets you select which to include.
 
+### Non-interactive / scripted use
+
+```bash
+rsyncer my_run_001 --yes
+```
+
+Skips all confirmation prompts:
+- Single server match: syncs without asking
+- Multiple matches: auto-selects the first one and prints it
+- Local directory creation: creates without asking
+
+```bash
+rsyncer my_run_001 --yes --dest /path/to/local/dir/
+```
+
+Sync into a specific local directory instead of `./<folder_name>/`.
+
 ### Browse recently active directories
 
 ```bash

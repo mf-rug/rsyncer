@@ -113,7 +113,7 @@ def get_slurm_workdirs(config, days=29):
     return dirs if dirs else None
 
 
-def show_recent(config, n, use_slurm=True, slurm_days=29):
+def show_recent(config, n, use_slurm=True, slurm_days=29, yes=False):
     """Show the n directories with most recently modified files on server."""
     server = config["server"]
     max_depth = config.get("max_depth", 5)
@@ -125,7 +125,10 @@ def show_recent(config, n, use_slurm=True, slurm_days=29):
             print(f"\nSLURM working directories ({len(slurm_dirs)}):\n")
             for i, d in enumerate(slurm_dirs, 1):
                 print(f"  {i}) {d}")
-            exclude = input("\nExclude any? Enter numbers to remove (e.g. 1,3) or press Enter to keep all: ").strip()
+            if yes:
+                exclude = ""
+            else:
+                exclude = input("\nExclude any? Enter numbers to remove (e.g. 1,3) or press Enter to keep all: ").strip()
             if exclude:
                 try:
                     remove_idxs = {int(x.strip()) for x in exclude.split(",") if x.strip()}
@@ -236,14 +239,17 @@ def pick_extensions(config, server_path):
     return None
 
 
-def do_rsync(config, server_path, local_folder, extensions=None):
-    """Run rsync to pull server_path into local_folder."""
+def do_rsync(config, server_path, local_folder, extensions=None, dest=None):
+    """Run rsync to pull server_path into a local directory.
+
+    If dest is given, sync there; otherwise sync to ./<local_folder>/.
+    """
     server = config["server"]
     flags = config.get("rsync_flags", "-auz --info=progress2 -h")
 
     # Ensure trailing slash on server path for correct content sync
     remote = f"{server}:{server_path.rstrip('/')}/"
-    local = f"./{local_folder}/"
+    local = f"{dest}/" if dest else f"./{local_folder}/"
 
     ext_filters = ""
     if extensions:
@@ -257,8 +263,8 @@ def do_rsync(config, server_path, local_folder, extensions=None):
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("Usage: rsyncer <folder_name> [--filter]")
-        print("       rsyncer --recent [N] [--days D] [--all]")
+        print("Usage: rsyncer <folder_name> [--filter] [-y] [--dest DIR]")
+        print("       rsyncer --recent [N] [--days D] [--all] [-y]")
         print()
         print("Syncs a remote directory to a local folder by name.")
         print()
@@ -268,6 +274,11 @@ def main():
         print()
         print("  --filter        List file extensions in the remote folder before syncing")
         print("                  and select which types to include.")
+        print()
+        print("  -y, --yes       Non-interactive mode: skip all confirmations,")
+        print("                  auto-select first match, auto-create local directory.")
+        print()
+        print("  --dest DIR      Sync into DIR instead of ./<folder_name>/.")
         print()
         print("  --recent [N]    List N most recently modified directories on the server")
         print("                  (default: 20). Uses recent SLURM job directories for speed.")
@@ -283,12 +294,29 @@ def main():
         print("  max_depth       Max find depth (default: 5)")
         sys.exit(0)
 
-    if sys.argv[1] == "--recent":
+    # Parse global flags (-y/--yes and --dest) from all argv positions
+    raw_args = sys.argv[1:]
+    yes = False
+    dest = None
+    filtered = []
+    i = 0
+    while i < len(raw_args):
+        if raw_args[i] in ("-y", "--yes"):
+            yes = True
+        elif raw_args[i] == "--dest" and i + 1 < len(raw_args):
+            i += 1
+            dest = raw_args[i]
+        else:
+            filtered.append(raw_args[i])
+        i += 1
+    raw_args = filtered
+
+    if raw_args and raw_args[0] == "--recent":
         config = load_config()
         n = 20
         use_slurm = True
         slurm_days = 29
-        args = sys.argv[2:]
+        args = raw_args[1:]
         positional_done = False
         i = 0
         while i < len(args):
@@ -309,12 +337,16 @@ def main():
                     print(f"Error: unexpected argument '{args[i]}'.", file=sys.stderr)
                     sys.exit(1)
             i += 1
-        show_recent(config, n, use_slurm=use_slurm, slurm_days=slurm_days)
+        show_recent(config, n, use_slurm=use_slurm, slurm_days=slurm_days, yes=yes)
         sys.exit(0)
 
-    args = sys.argv[1:]
+    args = raw_args
     filter_exts = "--filter" in args
     args = [a for a in args if a != "--filter"]
+
+    if not args:
+        print("Error: folder name required.", file=sys.stderr)
+        sys.exit(1)
 
     folder_name = os.path.basename(args[0].rstrip("/"))
 
@@ -326,26 +358,38 @@ def main():
         sys.exit(1)
     elif len(paths) == 1:
         chosen = paths[0]
-        answer = input(f"\nFound: {chosen}\nSync this? [Y/n] ").strip().lower()
-        if answer and answer != "y":
-            print("Aborted.")
-            sys.exit(0)
+        if yes:
+            print(f"Auto-selected: {chosen}")
+        else:
+            answer = input(f"\nFound: {chosen}\nSync this? [Y/n] ").strip().lower()
+            if answer and answer != "y":
+                print("Aborted.")
+                sys.exit(0)
     else:
-        chosen = pick_path(paths)
+        if yes:
+            chosen = paths[0]
+            print(f"Auto-selected (first match): {chosen}")
+        else:
+            chosen = pick_path(paths)
 
     extensions = None
     if filter_exts:
         extensions = pick_extensions(config, chosen)
 
-    if not os.path.isdir(folder_name):
-        answer = input(f"Local directory './{folder_name}' does not exist. Create it? [Y/n] ").strip().lower()
-        if answer and answer != "y":
-            print("Aborted.")
-            sys.exit(0)
-        os.makedirs(folder_name)
-        print(f"Created ./{folder_name}/")
+    local_dir = dest if dest else folder_name
+    if not os.path.isdir(local_dir):
+        if yes:
+            os.makedirs(local_dir)
+            print(f"Created {local_dir}/")
+        else:
+            answer = input(f"Local directory './{local_dir}' does not exist. Create it? [Y/n] ").strip().lower()
+            if answer and answer != "y":
+                print("Aborted.")
+                sys.exit(0)
+            os.makedirs(local_dir)
+            print(f"Created ./{local_dir}/")
 
-    do_rsync(config, chosen, folder_name, extensions=extensions)
+    do_rsync(config, chosen, folder_name, extensions=extensions, dest=dest)
 
 
 if __name__ == "__main__":
