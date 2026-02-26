@@ -1,0 +1,352 @@
+#!/usr/bin/env python3
+"""rsyncer — CLI tool to rsync from server by folder name."""
+
+import json
+import os
+import subprocess
+import sys
+
+CONFIG_PATH = os.path.expanduser("~/.config/rsyncer/config.json")
+
+
+def load_config():
+    """Load config from file, or create interactively on first run."""
+    if os.path.exists(CONFIG_PATH):
+        with open(CONFIG_PATH) as f:
+            return json.load(f)
+
+    print("No config found. Let's set up rsyncer.\n")
+
+    server = input("Server (e.g. user@hostname): ").strip()
+    if not server:
+        print("Error: server is required.", file=sys.stderr)
+        sys.exit(1)
+
+    raw = input("Search paths on server (comma-separated, e.g. /home/user,/data): ").strip()
+    search_paths = [p.strip() for p in raw.split(",") if p.strip()]
+    if not search_paths:
+        print("Error: at least one search path is required.", file=sys.stderr)
+        sys.exit(1)
+
+    config = {
+        "server": server,
+        "search_paths": search_paths,
+        "rsync_flags": "-auz --info=progress2 -h",
+        "max_depth": 5,
+    }
+
+    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
+    with open(CONFIG_PATH, "w") as f:
+        json.dump(config, f, indent=2)
+    print(f"\nConfig saved to {CONFIG_PATH}\n")
+
+    return config
+
+
+def find_on_server(config, folder_name):
+    """SSH to server and find directories matching folder_name."""
+    server = config["server"]
+    search_paths = " ".join(config["search_paths"])
+    max_depth = config.get("max_depth", 5)
+
+    cmd = (
+        f"find {search_paths} -maxdepth {max_depth} -type d "
+        f"-name '{folder_name}' 2>/dev/null"
+    )
+
+    print(f"Searching for '{folder_name}' on {server}...")
+    print(f"  ssh {server} \"{cmd}\"")
+    result = subprocess.run(
+        ["ssh", server, cmd],
+        capture_output=True, text=True,
+    )
+
+    if result.returncode != 0 and result.stderr.strip():
+        print(f"SSH error: {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    paths = [p.strip() for p in result.stdout.strip().splitlines() if p.strip()]
+    return paths
+
+
+def pick_path(paths):
+    """Let user pick from multiple matches."""
+    print(f"\nFound {len(paths)} matches:\n")
+    for i, p in enumerate(paths, 1):
+        print(f"  {i}) {p}")
+
+    while True:
+        choice = input(f"\nSelect [1-{len(paths)}]: ").strip()
+        try:
+            idx = int(choice)
+            if 1 <= idx <= len(paths):
+                return paths[idx - 1]
+        except ValueError:
+            pass
+        print("Invalid selection, try again.")
+
+
+def get_slurm_workdirs(config, days=29):
+    """Get unique working directories from recent SLURM jobs."""
+    server = config["server"]
+
+    cmd = (
+        f"sacct -S $(date +%Y-%m-%d -d '-{days} days') "
+        f"--format=WorkDir%199 --noheader "
+        f"| sort -u"
+    )
+
+    print(f"Querying SLURM for job directories from the last {days} days...")
+    print(f"  ssh {server} \"{cmd}\"")
+    result = subprocess.run(
+        ["ssh", server, cmd],
+        capture_output=True, text=True,
+    )
+
+    if result.returncode != 0 and result.stderr.strip():
+        print(f"sacct error: {result.stderr.strip()}", file=sys.stderr)
+        return None
+
+    dirs = list(dict.fromkeys(
+        p.strip() for p in result.stdout.strip().splitlines() if p.strip()
+    ))
+    return dirs if dirs else None
+
+
+def show_recent(config, n, use_slurm=True, slurm_days=29):
+    """Show the n directories with most recently modified files on server."""
+    server = config["server"]
+    max_depth = config.get("max_depth", 5)
+
+    # Determine search paths: from SLURM jobs or config
+    if use_slurm:
+        slurm_dirs = get_slurm_workdirs(config, slurm_days)
+        if slurm_dirs:
+            print(f"\nSLURM working directories ({len(slurm_dirs)}):\n")
+            for i, d in enumerate(slurm_dirs, 1):
+                print(f"  {i}) {d}")
+            exclude = input("\nExclude any? Enter numbers to remove (e.g. 1,3) or press Enter to keep all: ").strip()
+            if exclude:
+                try:
+                    remove_idxs = {int(x.strip()) for x in exclude.split(",") if x.strip()}
+                    slurm_dirs = [d for i, d in enumerate(slurm_dirs, 1) if i not in remove_idxs]
+                    print(f"Searching {len(slurm_dirs)} directories.\n")
+                except ValueError:
+                    print("Could not parse input, keeping all directories.\n")
+            if not slurm_dirs:
+                print("No directories left, falling back to configured search paths.\n")
+                search_paths = " ".join(config["search_paths"])
+            else:
+                # Prune subdirectories already covered by a parent
+                slurm_dirs.sort()
+                pruned = []
+                for d in slurm_dirs:
+                    if not any(d.startswith(parent + "/") for parent in pruned):
+                        pruned.append(d)
+                if len(pruned) < len(slurm_dirs):
+                    print(f"Pruned {len(slurm_dirs) - len(pruned)} subdirectories already covered by parents.")
+                search_paths = " ".join(f"'{d}'" for d in pruned)
+        else:
+            print("No SLURM jobs found, falling back to configured search paths.\n")
+            search_paths = " ".join(config["search_paths"])
+    else:
+        search_paths = " ".join(config["search_paths"])
+
+    cmd = (
+        f"find {search_paths} -maxdepth {max_depth} -type f "
+        f"-printf '%T@ %T+ %h\\n' 2>/dev/null "
+        f"| sort -rn | awk '!seen[$3]++' | head -n {n}"
+    )
+
+    print(f"Finding {n} most recently modified directories on {server}...")
+    print(f"  ssh {server} \"{cmd}\"")
+    result = subprocess.run(
+        ["ssh", server, cmd],
+        capture_output=True, text=True,
+    )
+
+    if result.returncode != 0 and result.stderr.strip():
+        print(f"SSH error: {result.stderr.strip()}", file=sys.stderr)
+        sys.exit(1)
+
+    lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+    if not lines:
+        print("No results found.")
+        return
+
+    print(f"\n{'#':>3}  {'Last modified':<26} Path")
+    print(f"{'':>3}  {'':─<26} {'':─<40}")
+    for i, line in enumerate(lines, 1):
+        parts = line.split(None, 2)
+        if len(parts) == 3:
+            _, timestamp, path = parts
+            # Clean up timestamp: 2026-02-17+14:30:22.123 -> 2026-02-17 14:30
+            timestamp = timestamp.replace("+", " ")[:16]
+            print(f"{i:>3}) {timestamp:<26} {path}")
+    print()
+
+
+def pick_extensions(config, server_path):
+    """Query file extensions in server_path and let user select which to sync."""
+    server = config["server"]
+
+    cmd = (
+        f"find '{server_path}' -type f "
+        f"| sed 's/.*\\.//' | sort | uniq -c | sort -rn"
+    )
+
+    print(f"\nFinding file types in {server_path}...")
+    print(f"  ssh {server} \"{cmd}\"")
+    result = subprocess.run(
+        ["ssh", server, cmd],
+        capture_output=True, text=True,
+    )
+
+    if result.returncode != 0 and result.stderr.strip():
+        print(f"SSH error: {result.stderr.strip()}", file=sys.stderr)
+        return None
+
+    lines = [l.strip() for l in result.stdout.strip().splitlines() if l.strip()]
+    if not lines:
+        print("No files found.")
+        return None
+
+    extensions = []
+    print(f"\nFile types found:\n")
+    for i, line in enumerate(lines, 1):
+        parts = line.split(None, 1)
+        if len(parts) == 2:
+            count, ext = parts
+            extensions.append(ext)
+            print(f"  {i}) .{ext} ({count} files)")
+
+    selection = input("\nInclude which? Enter numbers (e.g. 1,3,5) or press Enter for all: ").strip()
+    if not selection:
+        return None
+
+    try:
+        idxs = {int(x.strip()) for x in selection.split(",") if x.strip()}
+        chosen = [ext for i, ext in enumerate(extensions, 1) if i in idxs]
+        if chosen:
+            print(f"Filtering to: {', '.join('.' + e for e in chosen)}")
+            return chosen
+    except ValueError:
+        print("Could not parse input, syncing all files.")
+
+    return None
+
+
+def do_rsync(config, server_path, local_folder, extensions=None):
+    """Run rsync to pull server_path into local_folder."""
+    server = config["server"]
+    flags = config.get("rsync_flags", "-auz --info=progress2 -h")
+
+    # Ensure trailing slash on server path for correct content sync
+    remote = f"{server}:{server_path.rstrip('/')}/"
+    local = f"./{local_folder}/"
+
+    ext_filters = ""
+    if extensions:
+        includes = " ".join(f"--include='*.{ext}'" for ext in extensions)
+        ext_filters = f" --include='*/' {includes} --exclude='*'"
+
+    cmd = f"rsync {flags} --stats{ext_filters} {remote} {local}"
+    print(f"\nRunning: {cmd}\n")
+    subprocess.run(cmd, shell=True)
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print("Usage: rsyncer <folder_name> [--filter]")
+        print("       rsyncer --recent [N] [--days D] [--all]")
+        print()
+        print("Syncs a remote directory to a local folder by name.")
+        print()
+        print("  <folder_name>   Name of the folder to search for on the server.")
+        print("                  Strips leading paths and trailing slashes automatically.")
+        print("                  Creates the local directory if it doesn't exist.")
+        print()
+        print("  --filter        List file extensions in the remote folder before syncing")
+        print("                  and select which types to include.")
+        print()
+        print("  --recent [N]    List N most recently modified directories on the server")
+        print("                  (default: 20). Uses recent SLURM job directories for speed.")
+        print("    --days D      Look back D days in SLURM history (default: 29).")
+        print("    --all         Skip SLURM, search all configured search_paths (slow).")
+        print()
+        print("  -h, --help      Show this help message.")
+        print()
+        print(f"Config: {CONFIG_PATH}")
+        print("  server          SSH target, e.g. user@hostname")
+        print("  search_paths    List of directories to search on the server")
+        print("  rsync_flags     Flags passed to rsync (default: -auz --info=progress2 -h)")
+        print("  max_depth       Max find depth (default: 5)")
+        sys.exit(0)
+
+    if sys.argv[1] == "--recent":
+        config = load_config()
+        n = 20
+        use_slurm = True
+        slurm_days = 29
+        args = sys.argv[2:]
+        positional_done = False
+        i = 0
+        while i < len(args):
+            if args[i] == "--all":
+                use_slurm = False
+            elif args[i] == "--days" and i + 1 < len(args):
+                i += 1
+                try:
+                    slurm_days = int(args[i])
+                except ValueError:
+                    print("Error: --days expects a number.", file=sys.stderr)
+                    sys.exit(1)
+            elif not positional_done:
+                try:
+                    n = int(args[i])
+                    positional_done = True
+                except ValueError:
+                    print(f"Error: unexpected argument '{args[i]}'.", file=sys.stderr)
+                    sys.exit(1)
+            i += 1
+        show_recent(config, n, use_slurm=use_slurm, slurm_days=slurm_days)
+        sys.exit(0)
+
+    args = sys.argv[1:]
+    filter_exts = "--filter" in args
+    args = [a for a in args if a != "--filter"]
+
+    folder_name = os.path.basename(args[0].rstrip("/"))
+
+    config = load_config()
+    paths = find_on_server(config, folder_name)
+
+    if not paths:
+        print(f"No directories named '{folder_name}' found on server.", file=sys.stderr)
+        sys.exit(1)
+    elif len(paths) == 1:
+        chosen = paths[0]
+        answer = input(f"\nFound: {chosen}\nSync this? [Y/n] ").strip().lower()
+        if answer and answer != "y":
+            print("Aborted.")
+            sys.exit(0)
+    else:
+        chosen = pick_path(paths)
+
+    extensions = None
+    if filter_exts:
+        extensions = pick_extensions(config, chosen)
+
+    if not os.path.isdir(folder_name):
+        answer = input(f"Local directory './{folder_name}' does not exist. Create it? [Y/n] ").strip().lower()
+        if answer and answer != "y":
+            print("Aborted.")
+            sys.exit(0)
+        os.makedirs(folder_name)
+        print(f"Created ./{folder_name}/")
+
+    do_rsync(config, chosen, folder_name, extensions=extensions)
+
+
+if __name__ == "__main__":
+    main()
