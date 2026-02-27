@@ -9,6 +9,101 @@ import sys
 CONFIG_PATH = os.path.expanduser("~/.config/rsyncer/config.json")
 
 
+def test_ssh_connection(host):
+    """Test SSH connectivity in batch mode.
+
+    Returns (success, message) with actionable guidance on failure.
+    All diagnosis comes from ssh's exit code and stderr — no .ssh files are read.
+    """
+    try:
+        result = subprocess.run(
+            [
+                "ssh",
+                "-o", "BatchMode=yes",
+                "-o", "ConnectTimeout=10",
+                host,
+                "echo __rsyncer_ok__",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        return (False,
+            "SSH connection timed out after 15 seconds.\n"
+            "  - The hostname may be wrong or the server unreachable\n"
+            "  - A firewall or VPN may be blocking the connection")
+    except FileNotFoundError:
+        return (False, "ssh command not found. Is OpenSSH installed?")
+
+    if result.returncode == 0 and "__rsyncer_ok__" in result.stdout:
+        return (True, "Connected to '%s'." % host)
+
+    stderr = result.stderr.strip().lower()
+
+    if "could not resolve hostname" in stderr:
+        return (False,
+            "Hostname not found: '%s'\n"
+            "  - Check for typos in the hostname\n"
+            "  - If using an SSH alias, ensure it is defined in ~/.ssh/config" % host)
+
+    if "connection refused" in stderr:
+        return (False,
+            "Connection refused by '%s'\n"
+            "  - The SSH port may be wrong (default: 22)\n"
+            "  - The server may be down or decommissioned\n"
+            "  - Try a different login node if available" % host)
+
+    if "host key verification failed" in stderr:
+        return (False,
+            "Host key verification failed for '%s'\n"
+            "  Your ~/.ssh/known_hosts has a stale entry for this server\n"
+            "  (common after a cluster reinstall).\n"
+            "  Fix: ssh-keygen -R <hostname>   then connect manually once\n"
+            "  to accept the new host key." % host)
+
+    if "permission denied" in stderr and "keyboard-interactive" in stderr:
+        return (False,
+            "Authentication to '%s' requires 2FA (keyboard-interactive).\n"
+            "  Batch SSH calls cannot prompt for a 2FA code.\n"
+            "  Fix: set up SSH ControlMaster multiplexing.\n"
+            "\n"
+            "  1. Add to ~/.ssh/config:\n"
+            "\n"
+            "     Host %s\n"
+            "         HostName <cluster-login-node>\n"
+            "         User <your-username>\n"
+            "         ControlMaster auto\n"
+            "         ControlPath ~/.ssh/sockets/%%r@%%h-%%p\n"
+            "         ControlPersist 4h\n"
+            "\n"
+            "  2. Create the socket directory:\n"
+            "         mkdir -p ~/.ssh/sockets\n"
+            "\n"
+            "  3. Connect once interactively:\n"
+            "         ssh %s\n"
+            "\n"
+            "  After authenticating, all subsequent ssh/rsync/rsyncer calls\n"
+            "  reuse the authenticated connection for 4 hours." % (host, host, host))
+
+    if "permission denied" in stderr and "publickey" in stderr:
+        return (False,
+            "Public key authentication failed for '%s'\n"
+            "  - Check that your key is loaded: ssh-add -l\n"
+            "  - Check that IdentityFile is set correctly in ~/.ssh/config\n"
+            "  - Verify the public key is in authorized_keys on the server" % host)
+
+    if "permission denied" in stderr:
+        return (False,
+            "Permission denied connecting to '%s'\n"
+            "  SSH error: %s" % (host, result.stderr.strip()))
+
+    return (False,
+        "SSH connection to '%s' failed (exit code %d).\n"
+        "  SSH error: %s\n"
+        "  Try connecting manually: ssh %s" % (host, result.returncode, result.stderr.strip(), host))
+
+
 def load_config():
     """Load config from file, or create interactively on first run."""
     if os.path.exists(CONFIG_PATH):
@@ -16,13 +111,31 @@ def load_config():
             return json.load(f)
 
     print("No config found. Let's set up rsyncer.\n")
+    print("Server — the SSH target for your remote server.")
+    print("  You can use an SSH config alias (e.g. 'hpc') or user@hostname.")
+    print("  An SSH alias is recommended if your cluster uses 2FA.\n")
 
-    server = input("Server (e.g. user@hostname): ").strip()
+    server = input("Server (SSH alias or user@hostname): ").strip()
     if not server:
         print("Error: server is required.", file=sys.stderr)
         sys.exit(1)
 
-    raw = input("Search paths on server (comma-separated, e.g. /home/user,/data): ").strip()
+    # Test connection before saving
+    print("\nTesting SSH connection to '%s'..." % server)
+    ok, msg = test_ssh_connection(server)
+    print()
+    if ok:
+        print("  OK: %s" % msg)
+    else:
+        print("  FAILED:\n")
+        for line in msg.splitlines():
+            print("    %s" % line)
+        print()
+        print("  Fix your SSH connection and run rsyncer again.")
+        print("  Config will NOT be saved until the connection works.")
+        sys.exit(1)
+
+    raw = input("\nSearch paths on server (comma-separated, e.g. /home/user,/data): ").strip()
     search_paths = [p.strip() for p in raw.split(",") if p.strip()]
     if not search_paths:
         print("Error: at least one search path is required.", file=sys.stderr)
@@ -38,7 +151,7 @@ def load_config():
     os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
     with open(CONFIG_PATH, "w") as f:
         json.dump(config, f, indent=2)
-    print(f"\nConfig saved to {CONFIG_PATH}\n")
+    print("\nConfig saved to %s\n" % CONFIG_PATH)
 
     return config
 
@@ -288,7 +401,7 @@ def main():
         print("  -h, --help      Show this help message.")
         print()
         print(f"Config: {CONFIG_PATH}")
-        print("  server          SSH target, e.g. user@hostname")
+        print("  server          SSH target (alias or user@hostname)")
         print("  search_paths    List of directories to search on the server")
         print("  rsync_flags     Flags passed to rsync (default: -auz --info=progress2 -h)")
         print("  max_depth       Max find depth (default: 5)")

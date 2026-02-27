@@ -17,7 +17,7 @@ Instead of typing out full remote paths, you give rsyncer a folder name and it f
 
 - Python 3.6+
 - `rsync`
-- SSH access to the remote server
+- SSH access to the remote server (key-based or 2FA with ControlMaster)
 - *(Optional)* SLURM (`sacct`) on the server for `--recent` speed
 
 ## Installation
@@ -27,7 +27,9 @@ cp rsyncer ~/.local/bin/rsyncer
 chmod +x ~/.local/bin/rsyncer
 ```
 
-On first run, rsyncer will prompt you for your server and search paths and write a config file to `~/.config/rsyncer/config.json`.
+On first run, rsyncer will prompt you for your server and search paths, **test the
+SSH connection**, and write a config file to `~/.config/rsyncer/config.json`.
+If the connection test fails, the config is not saved — fix SSH first.
 
 ## Configuration
 
@@ -35,7 +37,7 @@ Config is stored at `~/.config/rsyncer/config.json`:
 
 ```json
 {
-  "server": "user@hostname",
+  "server": "hpc",
   "search_paths": ["/home/user", "/scratch/user"],
   "rsync_flags": "-auz --info=progress2 -h",
   "max_depth": 5
@@ -44,10 +46,38 @@ Config is stored at `~/.config/rsyncer/config.json`:
 
 | Key | Description | Default |
 |-----|-------------|---------|
-| `server` | SSH target (`user@hostname`) | — |
+| `server` | SSH target — an SSH config alias (e.g. `hpc`) or `user@hostname` | — |
 | `search_paths` | Directories to search on the server | — |
 | `rsync_flags` | Flags passed to rsync | `-auz --info=progress2 -h` |
 | `max_depth` | Max `find` depth when searching | `5` |
+
+An SSH config alias is recommended because it carries IdentityFile, ControlMaster,
+and other settings. See the SSH setup section below.
+
+## SSH setup for 2FA clusters
+
+If your server requires two-factor authentication, batch SSH calls will fail
+because they cannot prompt for a code. Set up SSH ControlMaster multiplexing:
+
+Add to `~/.ssh/config`:
+```
+Host hpc
+    HostName login.cluster.example.com
+    User your-username
+    IdentityFile ~/.ssh/your-key
+    ControlMaster auto
+    ControlPath ~/.ssh/sockets/%r@%h-%p
+    ControlPersist 4h
+```
+
+Then:
+```bash
+mkdir -p ~/.ssh/sockets
+ssh hpc   # log in once with your 2FA code
+```
+
+All subsequent rsyncer calls will reuse the connection for 4 hours.
+Use `hpc` as the server value during rsyncer setup.
 
 ## Usage
 
