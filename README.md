@@ -89,9 +89,25 @@ rsyncer my_run_001
 
 Searches for a directory named `my_run_001` on the server and rsyncs it into `./my_run_001/`.
 
-- Leading paths and trailing slashes are stripped automatically, so `rsyncer /scratch/user/my_run_001/` works too.
-- If multiple matches are found, you are prompted to pick one.
+- Trailing slashes are stripped automatically.
+- If multiple matches are found, you are prompted to pick one (or use `--path` to filter, see below).
 - If the local directory doesn't exist, you are asked before it is created.
+
+### Sync by absolute remote path
+
+```bash
+rsyncer /scratch/user/boltz_jobs/my_run_001
+```
+
+If the argument starts with `/`, rsyncer treats it as an absolute remote path and skips the search entirely. Handy when you already know exactly where it lives.
+
+### Disambiguate multiple matches with `--path`
+
+```bash
+rsyncer my_run_001 --path /scratch/user/boltz_jobs
+```
+
+When the same folder name exists under multiple parents, `--path PREFIX` restricts matches to those starting with `PREFIX`. Combines cleanly with `--yes` for scripted loops.
 
 ### Filter by file extension
 
@@ -111,6 +127,8 @@ Skips all confirmation prompts:
 - Single server match: syncs without asking
 - Multiple matches: auto-selects the first one and prints it
 - Local directory creation: creates without asking
+
+When stdin is not a TTY (e.g. piped input), multi-match selection also falls back to the first match automatically, so rsyncer never blocks on `input()` in a scripted loop.
 
 ```bash
 rsyncer my_run_001 --yes --dest /path/to/local/dir/

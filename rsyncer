@@ -376,14 +376,17 @@ def do_rsync(config, server_path, local_folder, extensions=None, dest=None):
 
 def main():
     if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
-        print("Usage: rsyncer <folder_name> [--filter] [-y] [--dest DIR]")
+        print("Usage: rsyncer <folder_name|remote_path> [--filter] [-y] [--dest DIR] [--path PREFIX]")
         print("       rsyncer --recent [N] [--days D] [--all] [-y]")
         print()
-        print("Syncs a remote directory to a local folder by name.")
+        print("Syncs a remote directory to a local folder by name or absolute path.")
         print()
         print("  <folder_name>   Name of the folder to search for on the server.")
         print("                  Strips leading paths and trailing slashes automatically.")
         print("                  Creates the local directory if it doesn't exist.")
+        print()
+        print("  <remote_path>   Absolute remote path (starts with '/'): skips search and")
+        print("                  syncs directly from that path.")
         print()
         print("  --filter        List file extensions in the remote folder before syncing")
         print("                  and select which types to include.")
@@ -392,6 +395,10 @@ def main():
         print("                  auto-select first match, auto-create local directory.")
         print()
         print("  --dest DIR      Sync into DIR instead of ./<folder_name>/.")
+        print()
+        print("  --path PREFIX   Filter multi-match results to paths starting with PREFIX.")
+        print("                  Useful for disambiguating when the same folder name exists")
+        print("                  under multiple parents.")
         print()
         print("  --recent [N]    List N most recently modified directories on the server")
         print("                  (default: 20). Uses recent SLURM job directories for speed.")
@@ -407,10 +414,11 @@ def main():
         print("  max_depth       Max find depth (default: 5)")
         sys.exit(0)
 
-    # Parse global flags (-y/--yes and --dest) from all argv positions
+    # Parse global flags (-y/--yes, --dest, --path) from all argv positions
     raw_args = sys.argv[1:]
     yes = False
     dest = None
+    path_prefix = None
     filtered = []
     i = 0
     while i < len(raw_args):
@@ -419,6 +427,9 @@ def main():
         elif raw_args[i] == "--dest" and i + 1 < len(raw_args):
             i += 1
             dest = raw_args[i]
+        elif raw_args[i] == "--path" and i + 1 < len(raw_args):
+            i += 1
+            path_prefix = raw_args[i]
         else:
             filtered.append(raw_args[i])
         i += 1
@@ -461,29 +472,40 @@ def main():
         print("Error: folder name required.", file=sys.stderr)
         sys.exit(1)
 
-    folder_name = os.path.basename(args[0].rstrip("/"))
-
+    input_arg = args[0].rstrip("/")
+    folder_name = os.path.basename(input_arg)
     config = load_config()
-    paths = find_on_server(config, folder_name)
 
-    if not paths:
-        print(f"No directories named '{folder_name}' found on server.", file=sys.stderr)
-        sys.exit(1)
-    elif len(paths) == 1:
-        chosen = paths[0]
-        if yes:
-            print(f"Auto-selected: {chosen}")
-        else:
-            answer = input(f"\nFound: {chosen}\nSync this? [Y/n] ").strip().lower()
-            if answer and answer != "y":
-                print("Aborted.")
-                sys.exit(0)
+    # Absolute remote path: skip search entirely.
+    if input_arg.startswith("/"):
+        chosen = input_arg
+        print(f"Using remote path: {chosen}")
     else:
-        if yes:
+        paths = find_on_server(config, folder_name)
+
+        if path_prefix:
+            before = len(paths)
+            paths = [p for p in paths if p.startswith(path_prefix)]
+            print(f"Filtered {before} → {len(paths)} match(es) with prefix {path_prefix!r}")
+
+        if not paths:
+            print(f"No directories named '{folder_name}' found on server.", file=sys.stderr)
+            sys.exit(1)
+        elif len(paths) == 1:
             chosen = paths[0]
-            print(f"Auto-selected (first match): {chosen}")
+            if yes:
+                print(f"Auto-selected: {chosen}")
+            else:
+                answer = input(f"\nFound: {chosen}\nSync this? [Y/n] ").strip().lower()
+                if answer and answer != "y":
+                    print("Aborted.")
+                    sys.exit(0)
         else:
-            chosen = pick_path(paths)
+            if yes or not sys.stdin.isatty():
+                chosen = paths[0]
+                print(f"Auto-selected (first match): {chosen}")
+            else:
+                chosen = pick_path(paths)
 
     extensions = None
     if filter_exts:
